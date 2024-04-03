@@ -501,7 +501,7 @@ class ParallelConfig:
 
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
         if self.world_size > 1:
-            if is_hip() and not self.worker_use_ray:
+            if not self.worker_use_ray:
                 logger.info("Using torchrun for multi-GPU on "
                             "ROCM platform. Use --worker-use-ray "
                             "to override")
