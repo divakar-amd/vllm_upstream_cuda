@@ -57,7 +57,7 @@ def main(args: argparse.Namespace):
                 llm.generate(prompt_token_ids=dummy_prompt_token_ids,
                              sampling_params=sampling_params,
                              use_tqdm=False)
-            print(p.key_averages())
+            print(p.key_averages().table(sort_by="self_cuda_time_total"))
         else:
             start_time = time.perf_counter()
             llm.generate(prompt_token_ids=dummy_prompt_token_ids,
@@ -75,10 +75,22 @@ def main(args: argparse.Namespace):
         if not profile_dir:
             profile_dir = Path(
                 "."
-            ) / "vllm_benchmark_result" / f"latency_result_{time.time()}"
+            ) / "vllm_benchmark_result" / f"latency_result_{args.input_len}_{args.output_len}_TP{args.tensor_parallel_size}"
         print(f"Profiling (results will be saved to '{profile_dir}')...")
         run_to_completion(profile_dir=profile_dir)
         return
+    if args.rpd:
+        print("[DV] Using RPD profiler.....")
+        from rpdTracerControl import rpdTracerControl
+        rpdTracerControl.setFilename(name = "/Projects/vllm_upstream/trace.rpd", append=True)
+        profile_rpd = rpdTracerControl()
+        profile_rpd.start()
+        print(f"RPD Profiling'...")
+        with torch.autograd.profiler.emit_nvtx():
+            run_to_completion(profile_dir=None)
+        profile_rpd.stop()
+        return
+
 
     # Benchmark.
     latencies = []
@@ -142,6 +154,10 @@ if __name__ == '__main__':
         default=None,
         help=('path to save the pytorch profiler output. Can be visualized '
               'with ui.perfetto.dev or Tensorboard.'))
+    parser.add_argument(
+        '--rpd',
+        action='store_true',
+        help='profile the generation process of a single batch using the rpd tracer')
     parser.add_argument(
         "--device",
         type=str,
