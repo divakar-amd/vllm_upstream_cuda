@@ -9,11 +9,15 @@ import torch
 from tqdm import tqdm
 
 from vllm import LLM, SamplingParams
-
+import pandas as pd
+import numpy as np
+def list_of_ints(arg):
+    return list(map(int, arg.split(',')))
 
 def main(args: argparse.Namespace):
     print(args)
-
+    if args.report:
+        results_df = pd.DataFrame(columns=['model', 'batch', 'tp', 'input', 'output', 'latency'])
     # NOTE(woosuk): If the request cannot be processed in a single batch,
     # the engine will automatically process the request in multiple batches.
     llm = LLM(model=args.model,
@@ -31,73 +35,88 @@ def main(args: argparse.Namespace):
               download_dir=args.download_dir,
               block_size=args.block_size)
 
-    sampling_params = SamplingParams(
-        n=args.n,
-        temperature=0.0 if args.use_beam_search else 1.0,
-        top_p=1.0,
-        use_beam_search=args.use_beam_search,
-        ignore_eos=True,
-        max_tokens=args.output_len,
-    )
-    print(sampling_params)
-    dummy_prompt_token_ids = np.random.randint(10000,
-                                               size=(args.batch_size,
-                                                     args.input_len))
-    dummy_prompt_token_ids = dummy_prompt_token_ids.tolist()
+    for batch_size in args.batch_size:
+        for output_len in args.output_len:
+            for input_len in args.input_len:
+                if torch.distributed.get_rank() == 0:
+                    print(f'>>>RUNNING {args.model} Batch_size:{batch_size} Input_len:{input_len} Output_len:{output_len}')
 
-    def run_to_completion(profile_dir: Optional[str] = None):
-        if profile_dir:
-            with torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                    on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                        str(profile_dir))) as p:
-                llm.generate(prompt_token_ids=dummy_prompt_token_ids,
-                             sampling_params=sampling_params,
-                             use_tqdm=False)
-            print(p.key_averages().table(sort_by="self_cuda_time_total"))
-        else:
-            start_time = time.perf_counter()
-            llm.generate(prompt_token_ids=dummy_prompt_token_ids,
-                         sampling_params=sampling_params,
-                         use_tqdm=False)
-            end_time = time.perf_counter()
-            latency = end_time - start_time
-            return latency
+                sampling_params = SamplingParams(
+                    n=args.n,
+                    temperature=0.0 if args.use_beam_search else 1.0,
+                    top_p=1.0,
+                    use_beam_search=args.use_beam_search,
+                    ignore_eos=True,
+                    max_tokens=output_len,
+                )
+                if torch.distributed.get_rank() == 0:
+                    print(sampling_params)
+                dummy_prompt_token_ids = np.random.randint(10000,
+                                                        size=(batch_size,
+                                                                input_len))
+                dummy_prompt_token_ids = dummy_prompt_token_ids.tolist()
 
-    print("Warming up...")
-    run_to_completion(profile_dir=None)
+                def run_to_completion(profile_dir: Optional[str] = None):
+                    if profile_dir:
+                        with torch.profiler.profile(
+                                activities=[
+                                    torch.profiler.ProfilerActivity.CPU,
+                                    torch.profiler.ProfilerActivity.CUDA,
+                                ],
+                                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                                    str(profile_dir))) as p:
+                            llm.generate(prompt_token_ids=dummy_prompt_token_ids,
+                                        sampling_params=sampling_params,
+                                        use_tqdm=False)
+                        print(p.key_averages().table(sort_by="self_cuda_time_total"))
+                    else:
+                        start_time = time.perf_counter()
+                        llm.generate(prompt_token_ids=dummy_prompt_token_ids,
+                                    sampling_params=sampling_params,
+                                    use_tqdm=False)
+                        end_time = time.perf_counter()
+                        latency = end_time - start_time
+                        return latency
 
-    if args.profile:
-        profile_dir = args.profile_result_dir
-        if not profile_dir:
-            profile_dir = Path(
-                "."
-            ) / "vllm_benchmark_result" / f"latency_result_{args.input_len}_{args.output_len}_TP{args.tensor_parallel_size}"
-        print(f"Profiling (results will be saved to '{profile_dir}')...")
-        run_to_completion(profile_dir=profile_dir)
-        return
-    if args.rpd:
-        print("[DV] Using RPD profiler.....")
-        from rpdTracerControl import rpdTracerControl
-        rpdTracerControl.setFilename(name = "/Projects/vllm_upstream/trace.rpd", append=True)
-        profile_rpd = rpdTracerControl()
-        profile_rpd.start()
-        print(f"RPD Profiling'...")
-        with torch.autograd.profiler.emit_nvtx():
-            run_to_completion(profile_dir=None)
-        profile_rpd.stop()
-        return
+                if torch.distributed.get_rank() == 0:
+                    print("Warming up...")
+                run_to_completion(profile_dir=None)
+
+                if args.profile:
+                    profile_dir = args.profile_result_dir
+                    if not profile_dir:
+                        profile_dir = Path(
+                            "."
+                        ) / "vllm_benchmark_result" / f"latency_result_{input_len}_{output_len}_TP{args.tensor_parallel_size}"
+                    print(f"Profiling (results will be saved to '{profile_dir}')...")
+                    run_to_completion(profile_dir=profile_dir)
+                    return
+                if args.rpd:
+                    print("[DV] Using RPD profiler.....")
+                    from rpdTracerControl import rpdTracerControl
+                    rpdTracerControl.setFilename(name = "/Projects/trace.rpd", append=True)
+                    profile_rpd = rpdTracerControl()
+                    profile_rpd.start()
+                    print(f"RPD Profiling'...")
+                    with torch.autograd.profiler.emit_nvtx():
+                        run_to_completion(profile_dir=None)
+                    profile_rpd.stop()
+                    return
 
 
-    # Benchmark.
-    latencies = []
-    for _ in tqdm(range(args.num_iters), desc="Profiling iterations"):
-        latencies.append(run_to_completion(profile_dir=None))
-    print(f'Avg latency: {np.mean(latencies)} seconds')
-
+                # Benchmark.
+                latencies = []
+                for _ in tqdm(range(args.num_iters), desc="Profiling iterations"):
+                    latencies.append(run_to_completion(profile_dir=None))
+                if torch.distributed.get_rank() == 0:
+                    latency=np.mean(latencies)
+                    print(f'Avg latency: {latency} seconds') 
+                    if args.report:
+                        entry = {'model':[args.model], 'tp':[args.tensor_parallel_size],'batch':[batch_size], 'input':[input_len], 'output':[output_len], 'latency':[latency]}
+                        results_df = pd.concat([results_df, pd.DataFrame(entry)], ignore_index=True)
+    
+    if torch.distributed.get_rank() == 0 and args.report:
+        print(results_df)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -110,9 +129,9 @@ if __name__ == '__main__':
                         choices=['awq', 'gptq', 'squeezellm', None],
                         default=None)
     parser.add_argument('--tensor-parallel-size', '-tp', type=int, default=1)
-    parser.add_argument('--input-len', type=int, default=32)
-    parser.add_argument('--output-len', type=int, default=128)
-    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--input-len', type=list_of_ints, default=32)
+    parser.add_argument('--output-len', type=list_of_ints, default=128)
+    parser.add_argument('--batch-size', type=list_of_ints, default=8)
     parser.add_argument('--n',
                         type=int,
                         default=1,
@@ -189,5 +208,7 @@ if __name__ == '__main__':
                         help='use Ray for distributed serving, will be '
                         'automatically set when using more than 1 GPU '
                         'unless on ROCm where the default is torchrun')
+    parser.add_argument('--report', action='store_true',
+                        help='turn on dataframe reporting')
     args = parser.parse_args()
     main(args)
